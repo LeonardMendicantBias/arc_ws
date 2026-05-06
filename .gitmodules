@@ -1,0 +1,3 @@
+[submodule "src/agentic"]
+	path = src/agentic
+	url = https://github.com/LeonardMendicantBias/agentic.git
