@@ -10,6 +10,11 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/checkpoints',
+            ['../agentic/checkpoints/dstt.pth',
+             '../agentic/checkpoints/decoder.pkl',
+             '../agentic/checkpoints/encoder.pkl',
+             '../enc.trt']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -24,6 +29,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'pub = client.codeword_publisher:main',
+            'sub = client.codeword_subscriber:main',
         ],
     },
 )
