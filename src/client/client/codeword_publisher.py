@@ -53,16 +53,21 @@ class CodePublisher(rclpy.node.Node):
 		mask_logits = self._enc(inp_mask)
 		self.mask_z = torch.argmax(mask_logits, dim=1)
 		self.get_logger().info(f'mask_z shape: {self.mask_z.shape}')
+		print("type", self.device.type)
 
 	def _enc(self, x: torch.Tensor) -> torch.Tensor:
-		with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.device.type == 'cuda'):
+		with torch.autocast(device_type=self.device.type, enabled=self.device.type=='cuda'):
 			return self.enc(x).float()
 		
 	def mask_callback(self, msg: Image):
 		img_np = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
-		inp_mask = map_pixels(torch.zeros(1, 3, self.img_height, self.img_width, device=self.device))
-		mask_logits = self._enc(inp_mask)
-		self.mask_z = torch.argmax(mask_logits, dim=1)
+		inp_frame = (
+			torch.from_numpy(img_np[:, :, :3].copy())
+			.permute(2, 0, 1).float().div_(255).unsqueeze(0).to(self.device)
+		)
+		inp_frame = map_pixels(inp_frame)  # (1, 3, H, W)
+		z_logits = self._enc(inp_frame)
+		self.mask_z = torch.argmax(z_logits, dim=1)
 
 	def img_callback(self, msg: Image):
 		now_ns = self.get_clock().now().nanoseconds
@@ -83,13 +88,14 @@ class CodePublisher(rclpy.node.Node):
 		# drop the top 3 zero bits, then repack the N*13 bits into bytes.
 		z_flat = z.squeeze(0).flatten().cpu().numpy().astype(np.uint16)  # (N,)
 		z_bytes = np.frombuffer(z_flat.astype('>u2').tobytes(), dtype=np.uint8)  # (N*2,)
-		bits = np.unpackbits(z_bytes).reshape(self.n_codewords, 16)[:, 16 - BITS_PER_CODEWORD:]  # (N, 13)
+		bits = np.unpackbits(z_bytes).reshape(self.n_codewords, 16)[:, 16 - self.enc.vocab_size:]  # (N, 13)
 		packed = np.packbits(bits.flatten()).tobytes()
 
 		code_msg = Code()
 		code_msg.header.stamp = self.get_clock().now().to_msg()
 		code_msg.header.frame_id = msg.header.frame_id
-		code_msg.length = BITS_PER_CODEWORD
+		# code_msg.length = self.enc.vocab_size
+		code_msg.header.length = z.shape[1] * z.shape[2]
 		code_msg.data = packed
 		self.code_pub.publish(code_msg)
 
