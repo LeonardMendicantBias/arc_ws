@@ -1,6 +1,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <arc_interfaces/msg/code.hpp>
+#include <arc_interfaces/msg/mask.hpp>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
 #include <torch/torch.h>
@@ -65,32 +66,44 @@ public:
       {1, 8192, h_prime_, w_prime_},
       torch::TensorOptions().dtype(torch::kFloat32).device(device_));
 
-    int input_idx = engine_->getBindingIndex("pixels");
-    int output_idx = engine_->getBindingIndex("conv2d_36");
-    context_->setBindingDimensions(input_idx,
-      nvinfer1::Dims4{1, 3, img_height_, img_width_});
+    int input_idx = -1, output_idx = -1;
+    for (int i = 0; i < engine_->getNbBindings(); ++i) {
+      if (engine_->bindingIsInput(i)) input_idx  = i;
+      else                            output_idx = i;
+    }
+    if (input_idx < 0 || output_idx < 0) {
+      throw std::runtime_error("TRT engine must have exactly one input and one output binding");
+    }
+    auto in_dims  = engine_->getBindingDimensions(input_idx);
+    auto out_dims = engine_->getBindingDimensions(output_idx);
+    if (in_dims.d[2] != img_height_ || in_dims.d[3] != img_width_) {
+      throw std::runtime_error(
+        "enc.trt was built for " +
+        std::to_string(in_dims.d[3]) + "x" + std::to_string(in_dims.d[2]) +
+        " but node expects " +
+        std::to_string(img_width_) + "x" + std::to_string(img_height_));
+    }
+    // Sanity-check that h_prime/w_prime match the engine's output spatial dims.
+    if (out_dims.d[2] != h_prime_ || out_dims.d[3] != w_prime_) {
+      throw std::runtime_error("enc.trt output spatial dims don't match h_prime/w_prime");
+    }
+
     bindings_[input_idx] = input_buf_.data_ptr<float>();
     bindings_[output_idx] = output_buf_.data_ptr<float>();
 
     img_sub_ = create_subscription<sensor_msgs::msg::Image>(
       "/camera/camera/color/image_raw", 1,
       std::bind(&CodePublisher::img_callback, this, std::placeholders::_1));
-    mask_sub_ = create_subscription<sensor_msgs::msg::Image>(
+    mask_sub_ = create_subscription<arc_interfaces::msg::Mask>(
       "/camera/camera/color/mask", 1,
       std::bind(&CodePublisher::mask_callback, this, std::placeholders::_1));
     code_pub_ = create_publisher<arc_interfaces::msg::Code>(
       "/camera/camera/color/code", 1);
 
-    // Warm-up: zeros through the full pipeline.
-    {
-      c10::cuda::CUDAStreamGuard guard(
-        c10::cuda::getStreamFromExternal(stream_, device_.index()));
-      input_buf_.copy_(map_pixels(
-        torch::zeros({1, 3, img_height_, img_width_}, device_)));
-    }
-    mask_z_ = torch::argmax(trt_forward(), 1);
-    RCLCPP_INFO(get_logger(), "mask_z shape: [%ld, %ld, %ld]",
-      mask_z_.size(0), mask_z_.size(1), mask_z_.size(2));
+    // Default mask: transmit all codewords until a Mask message arrives.
+    mask_indices_ = torch::arange(
+      n_codewords_,
+      torch::TensorOptions().dtype(torch::kInt64).device(device_));
   }
 
   ~CodePublisher()
@@ -119,6 +132,27 @@ private:
       throw std::runtime_error("Failed to deserialize TRT engine: " + path);
     }
     context_ = engine_->createExecutionContext();
+    if (!context_) {
+      throw std::runtime_error("Failed to create TRT execution context");
+    }
+    int nb = engine_->getNbBindings();
+    bindings_.resize(static_cast<size_t>(nb));
+
+    for (int i = 0; i < nb; ++i) {
+      auto dtype = engine_->getBindingDataType(i);
+      auto dims  = engine_->getBindingDimensions(i);
+      const char * dt_str =
+        (dtype == nvinfer1::DataType::kFLOAT) ? "FP32" :
+        (dtype == nvinfer1::DataType::kHALF)  ? "FP16" : "other";
+      std::fprintf(stderr, "[TRT] binding[%d] %-22s  %s  %s  dims=[%d,%d,%d,%d]\n",
+        i, engine_->getBindingName(i),
+        engine_->bindingIsInput(i) ? "INPUT " : "OUTPUT",
+        dt_str,
+        dims.nbDims > 0 ? dims.d[0] : -1,
+        dims.nbDims > 1 ? dims.d[1] : -1,
+        dims.nbDims > 2 ? dims.d[2] : -1,
+        dims.nbDims > 3 ? dims.d[3] : -1);
+    }
   }
 
   // Copies the ROS image into pinned memory, then asynchronously transfers
@@ -126,6 +160,13 @@ private:
   // entirely on stream_, writing directly into input_buf_.
   void load_image(const sensor_msgs::msg::Image::SharedPtr & msg)
   {
+    if (static_cast<int>(msg->height) != img_height_ ||
+        static_cast<int>(msg->width) != img_width_)
+    {
+      throw std::runtime_error(
+        "unexpected image resolution: " +
+        std::to_string(msg->width) + "x" + std::to_string(msg->height));
+    }
     const int n_ch = static_cast<int>(msg->data.size()) /
       (static_cast<int>(msg->height) * static_cast<int>(msg->width));
     uint8_t * dst = pinned_input_.data_ptr<uint8_t>();
@@ -157,7 +198,9 @@ private:
   // Submits input_buf_ to TRT on stream_, synchronizes, returns output_buf_.
   torch::Tensor trt_forward()
   {
-    context_->enqueueV2(bindings_, stream_, nullptr);
+    if (!context_->enqueueV2(bindings_.data(), stream_, nullptr)) {
+      throw std::runtime_error("TRT enqueueV2 failed");
+    }
     cudaStreamSynchronize(stream_);
     return output_buf_;
   }
@@ -183,31 +226,56 @@ private:
     return packed;
   }
 
-  void mask_callback(const sensor_msgs::msg::Image::SharedPtr msg)
+  void mask_callback(const arc_interfaces::msg::Mask::SharedPtr msg)
   {
-    load_image(msg);
-    mask_z_ = torch::argmax(trt_forward(), 1);
+    std::vector<int64_t> indices;
+    indices.reserve(msg->mask.size());
+    for (size_t i = 0; i < msg->mask.size(); ++i) {
+      if (msg->mask[i]) {
+        indices.push_back(static_cast<int64_t>(i));
+      }
+    }
+    if (indices.empty()) {
+      mask_indices_ = torch::empty(
+        {0}, torch::TensorOptions().dtype(torch::kInt64).device(device_));
+    } else {
+      mask_indices_ = torch::tensor(
+        indices, torch::TensorOptions().dtype(torch::kInt64)).to(device_);
+    }
   }
 
   void img_callback(const sensor_msgs::msg::Image::SharedPtr msg)
   {
-    int64_t now_ns = get_clock()->now().nanoseconds();
+    rclcpp::Time t0 = get_clock()->now();
 
     load_image(msg);
-    auto z = torch::argmax(trt_forward(), 1);  // (1, H', W')
-    auto packed = pack_codewords(z.squeeze(0).flatten());
+    auto z = torch::argmax(trt_forward(), 1);          // (1, H', W')
+    auto z_flat = z.squeeze(0).flatten();              // (H'*W',)
+    auto z_selected = z_flat.index_select(0, mask_indices_);
+
+    auto packed = pack_codewords(z_selected);
+    uint16_t n_selected = static_cast<uint16_t>(mask_indices_.size(0));
+
+    // Reconstruct a bool mask from mask_indices_ for the receiver.
+    auto indices_cpu = mask_indices_.to(torch::kCPU).contiguous();
+    std::vector<bool> mask_out(static_cast<size_t>(n_codewords_), false);
+    const int64_t * idx_data = indices_cpu.data_ptr<int64_t>();
+    for (int64_t i = 0; i < indices_cpu.size(0); ++i) {
+      mask_out[static_cast<size_t>(idx_data[i])] = true;
+    }
 
     arc_interfaces::msg::Code code_msg;
-    code_msg.header.stamp = get_clock()->now();
+    code_msg.header.stamp = msg->header.stamp;
     code_msg.header.frame_id = msg->header.frame_id;
-    code_msg.length = static_cast<uint16_t>(z.size(1) * z.size(2));
+    code_msg.length = n_selected;
     code_msg.data = packed;
+    code_msg.mask = mask_out;
     code_pub_->publish(code_msg);
 
-    double latency_ms = (get_clock()->now().nanoseconds() - now_ns) / 1e6;
+    double latency_ms = (get_clock()->now() - t0).nanoseconds() / 1e6;
     RCLCPP_INFO(get_logger(),
-      "codewords: %d  packed: %zu bytes  latency: %.4f ms",
-      n_codewords_, packed.size(), latency_ms);
+      "codewords: %d  selected: %d  packed: %zu bytes  latency: %.4f ms",
+      n_codewords_, n_selected, packed.size(), latency_ms);
   }
 
   const int img_width_, img_height_;
@@ -219,14 +287,15 @@ private:
   nvinfer1::ICudaEngine * engine_{nullptr};
   nvinfer1::IExecutionContext * context_{nullptr};
   cudaStream_t stream_{nullptr};
-  void * bindings_[2]{};
+  std::vector<void *> bindings_;
 
   torch::Tensor pinned_input_;
   torch::Tensor input_buf_, output_buf_;
-  torch::Tensor mask_z_;
+
+  torch::Tensor mask_indices_;
 
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr img_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr mask_sub_;
+  rclcpp::Subscription<arc_interfaces::msg::Mask>::SharedPtr mask_sub_;
   rclcpp::Publisher<arc_interfaces::msg::Code>::SharedPtr code_pub_;
 };
 

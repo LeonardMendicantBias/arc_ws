@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'client'
+package_name = 'arc'
 
 setup(
     name=package_name,
@@ -10,17 +10,13 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/checkpoints',
-            ['../agentic/checkpoints/dstt.pth',
-             '../agentic/checkpoints/decoder.pkl',
-             '../agentic/checkpoints/encoder.pkl']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='nvidia',
-    maintainer_email='nvidia@todo.todo',
+    maintainer_email='ngoak@islab.snu.ac.kr',
     description='TODO: Package description',
-    license='TODO: License declaration',
+    license='Apache-2.0',
     extras_require={
         'test': [
             'pytest',
@@ -28,9 +24,6 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'pub = client.codeword_publisher:main',
-            'sub = client.codeword_subscriber:main',
-            'mask = client.mask_publisher:main',
         ],
     },
 )

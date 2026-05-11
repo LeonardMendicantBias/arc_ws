@@ -7,7 +7,7 @@ from ament_index_python.packages import get_package_share_directory
 import numpy as np
 
 from sensor_msgs.msg import Image
-from arc_interfaces.msg import Code
+from arc_interfaces.msg import Code, Mask
 
 import torch
 
@@ -30,13 +30,11 @@ class CodePublisher(rclpy.node.Node):
 
 		share_dir = get_package_share_directory('client')
 		self.img_sub = self.create_subscription(
-			Image,
-			'/camera/camera/color/image_raw',
+			Image, '/camera/camera/color/image_raw',
 			self.img_callback, 1
 		)
 		self.mask_sub = self.create_subscription(
-			Image,
-			'/camera/camera/color/mask',
+			Mask, '/camera/camera/color/mask',
 			self.mask_callback, 1
 		)
 		self.code_pub = self.create_publisher(Code, '/camera/camera/color/code', 1)
@@ -49,25 +47,15 @@ class CodePublisher(rclpy.node.Node):
 		self.enc.eval()
 
 		# Warm-up pass to compute mask codewords
-		inp_mask = map_pixels(torch.zeros(1, 3, self.img_height, self.img_width, device=self.device))
-		mask_logits = self._enc(inp_mask)
-		self.mask_z = torch.argmax(mask_logits, dim=1)
-		self.get_logger().info(f'mask_z shape: {self.mask_z.shape}')
+		self.mask = np.ones(self.h_prime*self.w_prime, dtype=np.bool_)
 		print("type", self.device.type)
 
 	def _enc(self, x: torch.Tensor) -> torch.Tensor:
 		with torch.autocast(device_type=self.device.type, enabled=self.device.type=='cuda'):
 			return self.enc(x).float()
 		
-	def mask_callback(self, msg: Image):
-		img_np = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
-		inp_frame = (
-			torch.from_numpy(img_np[:, :, :3].copy())
-			.permute(2, 0, 1).float().div_(255).unsqueeze(0).to(self.device)
-		)
-		inp_frame = map_pixels(inp_frame)  # (1, 3, H, W)
-		z_logits = self._enc(inp_frame)
-		self.mask_z = torch.argmax(z_logits, dim=1)
+	def mask_callback(self, msg: Mask):
+		self.mask = np.frombuffer(msg.mask, dtype=np.bool_)#.reshape(msg.height, msg.width, -1)
 
 	def img_callback(self, msg: Image):
 		now_ns = self.get_clock().now().nanoseconds
@@ -87,20 +75,29 @@ class CodePublisher(rclpy.node.Node):
 		# View each uint16 value as big-endian 2 bytes, unpack to 16 bits,
 		# drop the top 3 zero bits, then repack the N*13 bits into bytes.
 		z_flat = z.squeeze(0).flatten().cpu().numpy().astype(np.uint16)  # (N,)
-		z_bytes = np.frombuffer(z_flat.astype('>u2').tobytes(), dtype=np.uint8)  # (N*2,)
-		bits = np.unpackbits(z_bytes).reshape(self.n_codewords, 16)[:, 16 - self.enc.vocab_size:]  # (N, 13)
+
+		# Select only codewords where mask == 1
+		mask_bool = self.mask.astype(bool)
+		z_selected = z_flat[mask_bool]  # (M,)
+		n_selected = len(z_selected)
+
+		if n_selected == 0:
+			return
+
+		z_bytes = np.frombuffer(z_selected.astype('>u2').tobytes(), dtype=np.uint8)  # (M*2,)
+		bits = np.unpackbits(z_bytes).reshape(n_selected, 16)[:, 16 - BITS_PER_CODEWORD:]  # (M, 13)
 		packed = np.packbits(bits.flatten()).tobytes()
 
 		code_msg = Code()
 		code_msg.header.stamp = self.get_clock().now().to_msg()
 		code_msg.header.frame_id = msg.header.frame_id
-		# code_msg.length = self.enc.vocab_size
-		code_msg.header.length = z.shape[1] * z.shape[2]
+		code_msg.length = n_selected
 		code_msg.data = packed
+		code_msg.mask = self.mask.tolist()
 		self.code_pub.publish(code_msg)
 
 		latency_ms = (self.get_clock().now().nanoseconds - now_ns) / 1e6
-		self.get_logger().info(f'codewords: {self.n_codewords}  packed: {len(packed)} bytes  latency: {latency_ms:.4f} ms')
+		self.get_logger().info(f'codewords: {n_selected}/{self.n_codewords}  packed: {len(packed)} bytes  latency: {latency_ms:.4f} ms')
 
 
 def main(args=None):

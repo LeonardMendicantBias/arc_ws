@@ -9,8 +9,8 @@ import numpy as np
 from sensor_msgs.msg import Image
 from arc_interfaces.msg import Code
 
-from dall_e import unmap_pixels, load_model
-from dall_e import Decoder
+from dall_e import map_pixels, unmap_pixels, load_model
+from dall_e import Encoder, Decoder
 
 import torch
 import torch.nn.functional as F
@@ -42,22 +42,43 @@ class CodeSubscriber(rclpy.node.Node):
 		self.dec.eval()
 		self.dec.to(self.device)
 
+		self.enc: Encoder = load_model(os.path.join(share_dir, 'checkpoints', 'encoder.pkl'))
+		for param in self.enc.parameters():
+			param.requires_grad_(False)
+		self.enc.eval()
+		self.enc.to(self.device)
+
+		inp_mask = map_pixels(
+			torch.zeros(1, 3, self.img_height, self.img_width, dtype=torch.float32, device=self.device)
+		)
+		with torch.no_grad():
+			mask_logits = self.enc(inp_mask)  # (1, VOCAB_SIZE, H', W')
+		# Pre-compute flat codeword indices for the fallback (non-transmitted) pixels
+		self.mask_code_flat = (
+			torch.argmax(mask_logits, dim=1).flatten().cpu().numpy().astype(np.int64)
+		)  # (N,)
+
 	def code_callback(self, msg: Code):
 		now_ns = self.get_clock().now().nanoseconds
 
-		# Unpack flat uint8 bytes back into (N,) codeword indices.
-		# Publisher packed N*13 bits MSB-first. To recover each 13-bit value, pad 3 zero
-		# bits at the front of each row (not the end) to form a 16-bit big-endian word.
-		bits = np.unpackbits(np.frombuffer(bytes(msg.data), dtype=np.uint8))
-		n_codewords = len(bits) // msg.length
-		codeword_bits = bits[:n_codewords * msg.length].reshape(n_codewords, msg.length)  # (N, 13)
-		padded = np.zeros((n_codewords, 16), dtype=np.uint8)
-		padded[:, 16 - msg.length:] = codeword_bits  # zero-pad at front → (N, 16)
-		z_flat = np.packbits(padded, axis=1).flatten().view(np.dtype('>u2')).astype(np.int64)  # (N,)
-
-		# The DALL-E encoder downsamples by 8x in each spatial dimension.
 		h_prime = self.img_height // 8
 		w_prime = self.img_width // 8
+		n_total = h_prime * w_prime
+
+		# Unpack the M transmitted codewords from packed bits.
+		# msg.length == M (number of selected codewords); each is BITS_PER_CODEWORD bits wide.
+		n_selected = msg.length  # M
+		raw_bits = np.unpackbits(np.frombuffer(bytes(msg.data), dtype=np.uint8))
+		codeword_bits = raw_bits[:n_selected * BITS_PER_CODEWORD].reshape(n_selected, BITS_PER_CODEWORD)  # (M, 13)
+		padded = np.zeros((n_selected, 16), dtype=np.uint8)
+		padded[:, 16 - BITS_PER_CODEWORD:] = codeword_bits  # zero-pad MSBs → (M, 16)
+		z_selected = np.packbits(padded, axis=1).flatten().view(np.dtype('>u2')).astype(np.int64)  # (M,)
+
+		# Build full z_flat (N,): seed with pre-computed mask fallback, fill transmitted positions.
+		mask_bool = np.array(msg.mask, dtype=bool)  # (N,)
+		z_flat = self.mask_code_flat.copy()          # (N,) fallback for non-transmitted pixels
+		z_flat[mask_bool] = z_selected               # overwrite transmitted positions
+
 		z = torch.from_numpy(z_flat.reshape(1, h_prime, w_prime)).to(self.device)  # (1, H', W')
 
 		z_one_hot = F.one_hot(z, num_classes=self.dec.vocab_size).permute(0, 3, 1, 2).float()
