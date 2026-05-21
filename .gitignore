@@ -8,9 +8,10 @@ log/
 __pycache__/
 
 .env
-.vscode
+.vscode/
+.claude/
 
 *.onnx
 *.onnx.data
 *.trt
-
+*.cache

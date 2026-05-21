@@ -10,6 +10,8 @@ import PIL
 
 from std_msgs.msg import Header
 from rcl_interfaces.msg import SetParametersResult
+from sensor_msgs.msg import Image
+from arc_interfaces.msg import Mask
 
 from agents.utils import export_masks, FinalAnswerTool
 from agents.tools.reid import ReIDTool
@@ -28,7 +30,14 @@ class VisionExpert(Node):
 	def __init__(self):
 		super().__init__('vision_expert')
 
-		self.declare_parameter('description', '')
+		self.recon_img_sub = self.create_subscription(
+			Image,
+			'/camera/camera/color/reconstructed',
+			self.img_callback, 1
+		)
+		self.mask_pub = self.create_publisher(Mask, '/camera/camera/color/mask', 1)
+
+		self.declare_parameter('description', Parameter.Type.STRING)
 		self.declare_parameter('modalities', Parameter.Type.STRING_ARRAY)
 		self.declare_parameter('classes', Parameter.Type.STRING_ARRAY)
 
@@ -134,7 +143,9 @@ class VisionExpert(Node):
 		)
 
 		return SetParametersResult(successful=True)
-
+	
+	def img_callback(self, img: Image):
+		pass
 
 def main(args=None):
 	rclpy.init(args=args)

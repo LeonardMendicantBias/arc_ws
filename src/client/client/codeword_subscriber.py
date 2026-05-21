@@ -23,7 +23,7 @@ class CodeSubscriber(rclpy.node.Node):
 
 	def __init__(self):
 		super().__init__('code_subscriber')
-		self.img_width, self.img_height = 640, 480
+		self.img_width, self.img_height = 320, 240
 
 		self.code_sub = self.create_subscription(
 			Code,
@@ -32,8 +32,7 @@ class CodeSubscriber(rclpy.node.Node):
 		)
 		self.rec_pub = self.create_publisher(Image, '/camera/camera/color/reconstructed', 1)
 
-		self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-		# self.device = "cpu"
+		self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 		share_dir = get_package_share_directory('client')
 		self.dec: Decoder = load_model(os.path.join(share_dir, 'checkpoints', 'decoder.pkl'))
@@ -42,6 +41,8 @@ class CodeSubscriber(rclpy.node.Node):
 		self.dec.eval()
 		self.dec.to(self.device)
 
+		# Encoder is used once at init to compute the fallback codewords for
+		# masked-out (non-transmitted) pixels.
 		self.enc: Encoder = load_model(os.path.join(share_dir, 'checkpoints', 'encoder.pkl'))
 		for param in self.enc.parameters():
 			param.requires_grad_(False)
@@ -52,18 +53,14 @@ class CodeSubscriber(rclpy.node.Node):
 			torch.zeros(1, 3, self.img_height, self.img_width, dtype=torch.float32, device=self.device)
 		)
 		with torch.no_grad():
-			mask_logits = self.enc(inp_mask)  # (1, VOCAB_SIZE, H', W')
-		# Pre-compute flat codeword indices for the fallback (non-transmitted) pixels
-		self.mask_code_flat = (
-			torch.argmax(mask_logits, dim=1).flatten().cpu().numpy().astype(np.int64)
-		)  # (N,)
+			mask_codes = torch.argmax(self.enc(inp_mask), dim=1)  # (1, H', W')
+		self.mask_code_flat = mask_codes.flatten().cpu().numpy().astype(np.int64)  # (N,)
 
 	def code_callback(self, msg: Code):
 		now_ns = self.get_clock().now().nanoseconds
 
 		h_prime = self.img_height // 8
 		w_prime = self.img_width // 8
-		n_total = h_prime * w_prime
 
 		# Unpack the M transmitted codewords from packed bits.
 		# msg.length == M (number of selected codewords); each is BITS_PER_CODEWORD bits wide.
@@ -82,7 +79,7 @@ class CodeSubscriber(rclpy.node.Node):
 		z = torch.from_numpy(z_flat.reshape(1, h_prime, w_prime)).to(self.device)  # (1, H', W')
 
 		z_one_hot = F.one_hot(z, num_classes=self.dec.vocab_size).permute(0, 3, 1, 2).float()
-		with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.device.type == 'cuda'):
+		with torch.no_grad(), torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.device.type == 'cuda'):
 			x_stats = self.dec(z_one_hot).float()  # (1, 6, H, W)
 		x_rec = unmap_pixels(torch.sigmoid(x_stats[:, :3]))  # (1, 3, H, W) in [0, 1]
 		img_np = (x_rec * 255).clamp(0, 255).byte().squeeze(0).permute(1, 2, 0).cpu().numpy()
