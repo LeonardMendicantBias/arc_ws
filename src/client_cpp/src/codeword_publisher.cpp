@@ -40,27 +40,23 @@ class CodePublisher : public rclcpp::Node
 public:
   CodePublisher()
   : Node("code_publisher"),
-    img_width_(640), img_height_(480),
-    h_prime_(img_height_ / 8), w_prime_(img_width_ / 8),
+    trt_w_(320), trt_h_(240),
+    h_prime_(trt_h_ / 8), w_prime_(trt_w_ / 8),
     n_codewords_(h_prime_ * w_prime_),
-    device_(torch::kCUDA)
+    device_(torch::kCUDA),
+    cam_h_(0), cam_w_(0)
   {
     if (cudaStreamCreate(&stream_) != cudaSuccess) {
       throw std::runtime_error("cudaStreamCreate failed");
     }
 
     std::string share_dir = ament_index_cpp::get_package_share_directory("client_cpp");
-    load_engine(share_dir + "/checkpoints/enc.trt");
-
-    // Pinned (page-locked) host buffer for async H2D of raw uint8 pixels.
-    // 3 channels hardcoded — this is a color camera topic.
-    pinned_input_ = torch::empty(
-      {img_height_, img_width_, 3},
-      torch::TensorOptions().dtype(torch::kUInt8).pinned_memory(true));
+    load_engine(share_dir + "/checkpoints/enc_int8.trt");
 
     // Pre-allocated CUDA buffers whose pointers are handed directly to TRT.
+    // Sized for the TRT engine's fixed input: 1x3x240x320.
     input_buf_ = torch::empty(
-      {1, 3, img_height_, img_width_},
+      {1, 3, trt_h_, trt_w_},
       torch::TensorOptions().dtype(torch::kFloat32).device(device_));
     output_buf_ = torch::empty(
       {1, 8192, h_prime_, w_prime_},
@@ -76,16 +72,16 @@ public:
     }
     auto in_dims  = engine_->getBindingDimensions(input_idx);
     auto out_dims = engine_->getBindingDimensions(output_idx);
-    if (in_dims.d[2] != img_height_ || in_dims.d[3] != img_width_) {
+    if (in_dims.d[2] != trt_h_ || in_dims.d[3] != trt_w_) {
       throw std::runtime_error(
-        "enc.trt was built for " +
+        "enc_int8.trt was built for" +
         std::to_string(in_dims.d[3]) + "x" + std::to_string(in_dims.d[2]) +
         " but node expects " +
-        std::to_string(img_width_) + "x" + std::to_string(img_height_));
+        std::to_string(trt_w_) + "x" + std::to_string(trt_h_));
     }
     // Sanity-check that h_prime/w_prime match the engine's output spatial dims.
     if (out_dims.d[2] != h_prime_ || out_dims.d[3] != w_prime_) {
-      throw std::runtime_error("enc.trt output spatial dims don't match h_prime/w_prime");
+      throw std::runtime_error("enc_int8.trt output spatial dims don't match h_prime/w_prime");
     }
 
     bindings_[input_idx] = input_buf_.data_ptr<float>();
@@ -101,9 +97,9 @@ public:
       "/camera/camera/color/code", 1);
 
     // Default mask: transmit all codewords until a Mask message arrives.
-    mask_indices_ = torch::arange(
-      n_codewords_,
-      torch::TensorOptions().dtype(torch::kInt64).device(device_));
+    mask_ = torch::ones(
+      {n_codewords_},
+      torch::TensorOptions().dtype(torch::kBool).device(device_));
   }
 
   ~CodePublisher()
@@ -143,7 +139,8 @@ private:
       auto dims  = engine_->getBindingDimensions(i);
       const char * dt_str =
         (dtype == nvinfer1::DataType::kFLOAT) ? "FP32" :
-        (dtype == nvinfer1::DataType::kHALF)  ? "FP16" : "other";
+        (dtype == nvinfer1::DataType::kHALF)  ? "FP16" :
+        (dtype == nvinfer1::DataType::kINT8)   ? "INT8" : "other";
       std::fprintf(stderr, "[TRT] binding[%d] %-22s  %s  %s  dims=[%d,%d,%d,%d]\n",
         i, engine_->getBindingName(i),
         engine_->bindingIsInput(i) ? "INPUT " : "OUTPUT",
@@ -155,28 +152,34 @@ private:
     }
   }
 
-  // Copies the ROS image into pinned memory, then asynchronously transfers
-  // it to the GPU and preprocesses (HWC uint8 -> CHW float32 in [eps,1-eps])
-  // entirely on stream_, writing directly into input_buf_.
+  // Copies the ROS image into pinned memory, transfers to GPU, resizes to
+  // the TRT engine's fixed input (trt_h_ x trt_w_) if needed, then
+  // preprocesses (HWC uint8 -> CHW float32 in [eps,1-eps]) into input_buf_.
   void load_image(const sensor_msgs::msg::Image::SharedPtr & msg)
   {
-    if (static_cast<int>(msg->height) != img_height_ ||
-        static_cast<int>(msg->width) != img_width_)
-    {
-      throw std::runtime_error(
-        "unexpected image resolution: " +
-        std::to_string(msg->width) + "x" + std::to_string(msg->height));
+    const int new_h = static_cast<int>(msg->height);
+    const int new_w = static_cast<int>(msg->width);
+
+    // Re-allocate pinned host buffer only when the camera resolution changes.
+    if (new_h != cam_h_ || new_w != cam_w_) {
+      cam_h_ = new_h;
+      cam_w_ = new_w;
+      pinned_input_ = torch::empty(
+        {cam_h_, cam_w_, 3},
+        torch::TensorOptions().dtype(torch::kUInt8).pinned_memory(true));
+      RCLCPP_INFO(get_logger(),
+        "camera %dx%d -> TRT input %dx%d", cam_w_, cam_h_, trt_w_, trt_h_);
     }
-    const int n_ch = static_cast<int>(msg->data.size()) /
-      (static_cast<int>(msg->height) * static_cast<int>(msg->width));
+
+    const int n_ch = static_cast<int>(msg->data.size()) / (cam_h_ * cam_w_);
     uint8_t * dst = pinned_input_.data_ptr<uint8_t>();
     const uint8_t * src = msg->data.data();
 
     if (n_ch == 3) {
-      std::memcpy(dst, src, static_cast<size_t>(img_height_ * img_width_ * 3));
+      std::memcpy(dst, src, static_cast<size_t>(cam_h_ * cam_w_ * 3));
     } else {
       // Strip extra channels (e.g. RGBA -> RGB) on CPU before transfer.
-      for (int i = 0; i < img_height_ * img_width_; ++i, dst += 3, src += n_ch) {
+      for (int i = 0; i < cam_h_ * cam_w_; ++i, dst += 3, src += n_ch) {
         dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
       }
     }
@@ -185,14 +188,25 @@ private:
     at::cuda::CUDAStreamGuard guard(
       at::cuda::getStreamFromExternal(stream_, device_.index()));
 
-    // Async H2D: 0.9 MB uint8 (vs 3.7 MB float without this optimization).
+    // Async H2D.
     auto gpu_uint8 = pinned_input_.to(device_, /*non_blocking=*/true);
 
     // GPU: (H,W,3) uint8 -> (1,3,H,W) float32 in [eps, 1-eps].
-    input_buf_.copy_(
-      map_pixels(
-        gpu_uint8.unsqueeze(0).permute({0, 3, 1, 2})
-        .to(torch::kFloat32).mul_(1.0f / 255.0f)));
+    auto gpu_float = map_pixels(
+      gpu_uint8.unsqueeze(0).permute({0, 3, 1, 2})
+      .to(torch::kFloat32).mul_(1.0f / 255.0f));
+
+    // Bilinear resize to TRT engine input dims when camera resolution differs.
+    if (cam_h_ != trt_h_ || cam_w_ != trt_w_) {
+      gpu_float = torch::nn::functional::interpolate(
+        gpu_float,
+        torch::nn::functional::InterpolateFuncOptions()
+          .size(std::vector<int64_t>{trt_h_, trt_w_})
+          .mode(torch::kBilinear)
+          .align_corners(false));
+    }
+
+    input_buf_.copy_(gpu_float);
   }
 
   // Submits input_buf_ to TRT on stream_, synchronizes, returns output_buf_.
@@ -228,20 +242,9 @@ private:
 
   void mask_callback(const arc_interfaces::msg::Mask::SharedPtr msg)
   {
-    std::vector<int64_t> indices;
-    indices.reserve(msg->mask.size());
-    for (size_t i = 0; i < msg->mask.size(); ++i) {
-      if (msg->mask[i]) {
-        indices.push_back(static_cast<int64_t>(i));
-      }
-    }
-    if (indices.empty()) {
-      mask_indices_ = torch::empty(
-        {0}, torch::TensorOptions().dtype(torch::kInt64).device(device_));
-    } else {
-      mask_indices_ = torch::tensor(
-        indices, torch::TensorOptions().dtype(torch::kInt64)).to(device_);
-    }
+    std::vector<uint8_t> tmp(msg->mask.begin(), msg->mask.end());
+    mask_ = torch::tensor(
+      tmp, torch::TensorOptions().dtype(torch::kUInt8)).to(torch::kBool).to(device_);
   }
 
   void img_callback(const sensor_msgs::msg::Image::SharedPtr msg)
@@ -251,18 +254,15 @@ private:
     load_image(msg);
     auto z = torch::argmax(trt_forward(), 1);          // (1, H', W')
     auto z_flat = z.squeeze(0).flatten();              // (H'*W',)
-    auto z_selected = z_flat.index_select(0, mask_indices_);
+    auto mask_indices = mask_.nonzero().squeeze(1);    // selected indices
+    auto z_selected = z_flat.index_select(0, mask_indices);
 
     auto packed = pack_codewords(z_selected);
-    uint16_t n_selected = static_cast<uint16_t>(mask_indices_.size(0));
+    uint16_t n_selected = static_cast<uint16_t>(mask_indices.size(0));
 
-    // Reconstruct a bool mask from mask_indices_ for the receiver.
-    auto indices_cpu = mask_indices_.to(torch::kCPU).contiguous();
-    std::vector<bool> mask_out(static_cast<size_t>(n_codewords_), false);
-    const int64_t * idx_data = indices_cpu.data_ptr<int64_t>();
-    for (int64_t i = 0; i < indices_cpu.size(0); ++i) {
-      mask_out[static_cast<size_t>(idx_data[i])] = true;
-    }
+    auto mask_cpu = mask_.to(torch::kCPU).contiguous();
+    const bool * mask_ptr = mask_cpu.data_ptr<bool>();
+    std::vector<bool> mask_out(mask_ptr, mask_ptr + mask_cpu.numel());
 
     arc_interfaces::msg::Code code_msg;
     code_msg.header.stamp = msg->header.stamp;
@@ -278,9 +278,10 @@ private:
       n_codewords_, n_selected, packed.size(), latency_ms);
   }
 
-  const int img_width_, img_height_;
+  const int trt_w_, trt_h_;
   const int h_prime_, w_prime_, n_codewords_;
   torch::Device device_;
+  int cam_h_, cam_w_;
 
   TRTLogger logger_;
   nvinfer1::IRuntime * runtime_{nullptr};
@@ -292,7 +293,7 @@ private:
   torch::Tensor pinned_input_;
   torch::Tensor input_buf_, output_buf_;
 
-  torch::Tensor mask_indices_;
+  torch::Tensor mask_;
 
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr img_sub_;
   rclcpp::Subscription<arc_interfaces::msg::Mask>::SharedPtr mask_sub_;

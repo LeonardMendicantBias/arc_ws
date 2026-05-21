@@ -22,10 +22,29 @@ list(APPEND CMAKE_PREFIX_PATH "${TORCH_CMAKE_PREFIX_PATH}")
 find_package(Torch REQUIRED)
 
 # TensorRT is installed system-wide by JetPack
+# find_library(NVINFER_LIB nvinfer REQUIRED
+#   PATHS /usr/lib/aarch64-linux-gnu)
+# find_path(NVINFER_INCLUDE_DIR NvInfer.h REQUIRED
+#   PATHS /usr/include/aarch64-linux-gnu)
+
+set(TENSORRT_LIB_SEARCH_PATHS
+  /usr/lib/aarch64-linux-gnu        # JetPack
+  /usr/lib/x86_64-linux-gnu         # Ubuntu .deb on x86_64
+  /usr/local/cuda/lib64             # CUDA-bundled
+  /usr/local/tensorrt/lib           # tarball install
+  $ENV{TENSORRT_ROOT}/lib           # user override
+)
+set(TENSORRT_INCLUDE_SEARCH_PATHS
+  /usr/include/aarch64-linux-gnu
+  /usr/include/x86_64-linux-gnu
+  /usr/local/cuda/include
+  /usr/local/tensorrt/include
+  $ENV{TENSORRT_ROOT}/include
+)
 find_library(NVINFER_LIB nvinfer REQUIRED
-  PATHS /usr/lib/aarch64-linux-gnu)
+  PATHS ${TENSORRT_LIB_SEARCH_PATHS})
 find_path(NVINFER_INCLUDE_DIR NvInfer.h REQUIRED
-  PATHS /usr/include/aarch64-linux-gnu)
+  PATHS ${TENSORRT_INCLUDE_SEARCH_PATHS})
 
 add_executable(codeword_publisher src/codeword_publisher.cpp)
 target_include_directories(codeword_publisher PRIVATE
@@ -53,7 +72,7 @@ install(TARGETS codeword_publisher
   DESTINATION lib/${PROJECT_NAME}
 )
 
-install(FILES enc.trt
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../client/client/enc_int8.trt
   DESTINATION share/${PROJECT_NAME}/checkpoints
 )
 

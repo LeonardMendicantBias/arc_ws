@@ -1,0 +1,101 @@
+TRT-8601-EntropyCalibration2
+pixels: 3bef5016
+/blocks/input/Cast_output_0: 3bef5016
+/blocks/input/Conv_output_0: 3ca1b1f9
+/blocks/group_1/block_1/res_path/relu_1/Relu_output_0: 3c8d8a9a
+/blocks/group_1/block_1/res_path/conv_1/Conv_output_0: 3e10bd14
+/blocks/group_1/block_1/res_path/relu_2/Relu_output_0: 3dd9e35e
+/blocks/group_1/block_1/res_path/conv_2/Conv_output_0: 3db9e253
+/blocks/group_1/block_1/res_path/relu_3/Relu_output_0: 3db9e253
+/blocks/group_1/block_1/res_path/conv_3/Conv_output_0: 3ecad746
+/blocks/group_1/block_1/res_path/relu_4/Relu_output_0: 3ec8b61a
+/blocks/group_1/block_1/res_path/conv_4/Conv_output_0: 3f0c945d
+(Unnamed Layer* 11) [Shuffle]_output: 39010a14
+/blocks/group_1/block_1/Mul_output_0: 3c0c945d
+/blocks/group_1/block_1/Add_output_0: 3c992668
+/blocks/group_1/block_2/res_path/relu_1/Relu_output_0: 3c7c2adf
+/blocks/group_1/block_2/res_path/conv_1/Conv_output_0: 3dde26f5
+/blocks/group_1/block_2/res_path/relu_2/Relu_output_0: 3d9092fe
+/blocks/group_1/block_2/res_path/conv_2/Conv_output_0: 3e15373b
+/blocks/group_1/block_2/res_path/relu_3/Relu_output_0: 3e15373b
+/blocks/group_1/block_2/res_path/conv_3/Conv_output_0: 3e9bb113
+/blocks/group_1/block_2/res_path/relu_4/Relu_output_0: 3ea384bc
+/blocks/group_1/block_2/res_path/conv_4/Conv_output_0: 3e9ce07b
+(Unnamed Layer* 23) [Shuffle]_output: 39010a14
+/blocks/group_1/block_2/Mul_output_0: 3b9ce07b
+/blocks/group_1/block_2/Add_output_0: 3c8b387e
+/blocks/group_1/pool/MaxPool_output_0: 3c8b387e
+/blocks/group_2/block_1/id_path/Conv_output_0: 3c547a46
+/blocks/group_2/block_1/res_path/relu_1/Relu_output_0: 3c692faa
+/blocks/group_2/block_1/res_path/conv_1/Conv_output_0: 3d9e3a18
+/blocks/group_2/block_1/res_path/relu_2/Relu_output_0: 3d36f61e
+/blocks/group_2/block_1/res_path/conv_2/Conv_output_0: 3e17941a
+/blocks/group_2/block_1/res_path/relu_3/Relu_output_0: 3e11397d
+/blocks/group_2/block_1/res_path/conv_3/Conv_output_0: 3f28dae7
+/blocks/group_2/block_1/res_path/relu_4/Relu_output_0: 3ec9216c
+/blocks/group_2/block_1/res_path/conv_4/Conv_output_0: 3f0600e4
+(Unnamed Layer* 37) [Shuffle]_output: 39010a14
+/blocks/group_2/block_1/Mul_output_0: 3c0600e4
+/blocks/group_2/block_1/Add_output_0: 3c5ea2b0
+/blocks/group_2/block_2/res_path/relu_1/Relu_output_0: 3c1db303
+/blocks/group_2/block_2/res_path/conv_1/Conv_output_0: 3df6cbb9
+/blocks/group_2/block_2/res_path/relu_2/Relu_output_0: 3d9378b9
+/blocks/group_2/block_2/res_path/conv_2/Conv_output_0: 3e14edd9
+/blocks/group_2/block_2/res_path/relu_3/Relu_output_0: 3da2fc6a
+/blocks/group_2/block_2/res_path/conv_3/Conv_output_0: 3e934762
+/blocks/group_2/block_2/res_path/relu_4/Relu_output_0: 3e3e1ff4
+/blocks/group_2/block_2/res_path/conv_4/Conv_output_0: 3e656834
+(Unnamed Layer* 49) [Shuffle]_output: 39010a14
+/blocks/group_2/block_2/Mul_output_0: 3b656834
+/blocks/group_2/block_2/Add_output_0: 3c5fbfc2
+/blocks/group_2/pool/MaxPool_output_0: 3c5fbfc2
+/blocks/group_3/block_1/id_path/Conv_output_0: 3d235904
+/blocks/group_3/block_1/res_path/relu_1/Relu_output_0: 3c377824
+/blocks/group_3/block_1/res_path/conv_1/Conv_output_0: 3e4765bc
+/blocks/group_3/block_1/res_path/relu_2/Relu_output_0: 3deb2d9c
+/blocks/group_3/block_1/res_path/conv_2/Conv_output_0: 3eec4d3c
+/blocks/group_3/block_1/res_path/relu_3/Relu_output_0: 3e45eddb
+/blocks/group_3/block_1/res_path/conv_3/Conv_output_0: 3f9982ed
+/blocks/group_3/block_1/res_path/relu_4/Relu_output_0: 3f91b5d1
+/blocks/group_3/block_1/res_path/conv_4/Conv_output_0: 3f82f7d1
+(Unnamed Layer* 63) [Shuffle]_output: 39010a14
+/blocks/group_3/block_1/Mul_output_0: 3c82f7d1
+/blocks/group_3/block_1/Add_output_0: 3d312fd7
+/blocks/group_3/block_2/res_path/relu_1/Relu_output_0: 3d156c65
+/blocks/group_3/block_2/res_path/conv_1/Conv_output_0: 3f04ceeb
+/blocks/group_3/block_2/res_path/relu_2/Relu_output_0: 3eaae2f5
+/blocks/group_3/block_2/res_path/conv_2/Conv_output_0: 3f430727
+/blocks/group_3/block_2/res_path/relu_3/Relu_output_0: 3f062597
+/blocks/group_3/block_2/res_path/conv_3/Conv_output_0: 3ffc3b54
+/blocks/group_3/block_2/res_path/relu_4/Relu_output_0: 3fa024cc
+/blocks/group_3/block_2/res_path/conv_4/Conv_output_0: 3fe2b782
+(Unnamed Layer* 75) [Shuffle]_output: 39010a14
+/blocks/group_3/block_2/Mul_output_0: 3ce2b782
+/blocks/group_3/block_2/Add_output_0: 3d4295ba
+/blocks/group_3/pool/MaxPool_output_0: 3d4295ba
+/blocks/group_4/block_1/id_path/Conv_output_0: 3f0262a6
+/blocks/group_4/block_1/res_path/relu_1/Relu_output_0: 3d29a3dc
+/blocks/group_4/block_1/res_path/conv_1/Conv_output_0: 3f5f87f5
+/blocks/group_4/block_1/res_path/relu_2/Relu_output_0: 3f20494e
+/blocks/group_4/block_1/res_path/conv_2/Conv_output_0: 406b1b79
+/blocks/group_4/block_1/res_path/relu_3/Relu_output_0: 400585c9
+/blocks/group_4/block_1/res_path/conv_3/Conv_output_0: 418354d0
+/blocks/group_4/block_1/res_path/relu_4/Relu_output_0: 418a1864
+/blocks/group_4/block_1/res_path/conv_4/Conv_output_0: 426bc59c
+(Unnamed Layer* 89) [Shuffle]_output: 39010a14
+/blocks/group_4/block_1/Mul_output_0: 3f6bc59c
+/blocks/group_4/block_1/Add_output_0: 3f894763
+/blocks/group_4/block_2/res_path/relu_1/Relu_output_0: 3f2bc94c
+/blocks/group_4/block_2/res_path/conv_1/Conv_output_0: 40af6768
+/blocks/group_4/block_2/res_path/relu_2/Relu_output_0: 4085f5d4
+/blocks/group_4/block_2/res_path/conv_2/Conv_output_0: 418056d2
+/blocks/group_4/block_2/res_path/relu_3/Relu_output_0: 40a00707
+/blocks/group_4/block_2/res_path/conv_3/Conv_output_0: 4250efb5
+/blocks/group_4/block_2/res_path/relu_4/Relu_output_0: 41950b6b
+/blocks/group_4/block_2/res_path/conv_4/Conv_output_0: 421ecb3b
+(Unnamed Layer* 101) [Shuffle]_output: 39010a14
+/blocks/group_4/block_2/Mul_output_0: 3f1ecb3b
+/blocks/group_4/block_2/Add_output_0: 3fa49cd4
+/blocks/output/relu/Relu_output_0: 3f66a86b
+/blocks/output/conv/Cast_output_0: 3f66a86b
+logits: 409e9b08

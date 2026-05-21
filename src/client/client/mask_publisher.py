@@ -11,7 +11,7 @@ class MaskPublisher(rclpy.node.Node):
     def __init__(self):
         super().__init__('mask_publisher')
 
-        self.img_width, self.img_height = 640, 480
+        self.img_width, self.img_height = 320, 240
         self.h_prime = self.img_height // 8
         self.w_prime = self.img_width // 8
         self.n_codewords = self.h_prime * self.w_prime

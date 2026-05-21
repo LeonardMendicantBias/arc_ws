@@ -9,6 +9,7 @@ import numpy as np
 from sensor_msgs.msg import Image
 from arc_interfaces.msg import Code, Mask
 
+import cv2
 import torch
 
 from dall_e import map_pixels, load_model
@@ -23,7 +24,7 @@ class CodePublisher(rclpy.node.Node):
 	def __init__(self):
 		super().__init__('code_publisher')
 
-		self.img_width, self.img_height = 640, 480
+		self.img_width, self.img_height = 320, 240
 		self.h_prime = self.img_height // 8
 		self.w_prime = self.img_width // 8
 		self.n_codewords = self.h_prime * self.w_prime
@@ -62,6 +63,8 @@ class CodePublisher(rclpy.node.Node):
 
 		# Skip PIL: convert ROS image bytes directly to a float tensor in [0, 1]
 		img_np = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
+		if img_np.shape[0] != self.img_height or img_np.shape[1] != self.img_width:
+			img_np = cv2.resize(img_np, (self.img_width, self.img_height), interpolation=cv2.INTER_LINEAR)
 		inp_frame = (
 			torch.from_numpy(img_np[:, :, :3].copy())
 			.permute(2, 0, 1).float().div_(255).unsqueeze(0).to(self.device)
