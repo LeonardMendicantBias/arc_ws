@@ -10,6 +10,9 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/checkpoints', [
+            '../agentic/checkpoints/dstt.pth',
+        ]),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -27,6 +30,7 @@ setup(
             'interpreter = server.interpreter:main',
             'vision_expert = server.vision_expert:main',
             'critic = server.critic:main',
+            'inpainter = server.inpainter:main',
         ],
     },
 )

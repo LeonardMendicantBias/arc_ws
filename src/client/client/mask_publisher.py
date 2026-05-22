@@ -17,10 +17,11 @@ class MaskPublisher(rclpy.node.Node):
         self.n_codewords = self.h_prime * self.w_prime
 
         self.mask_pub = self.create_publisher(Mask, '/camera/camera/color/mask', 1)
-        self.create_timer(1.0, self.timer_callback)
+        self.create_timer(1.0 / 10.0, self.timer_callback)
 
     def timer_callback(self):
-        mask = np.random.randint(0, 2, size=self.n_codewords, dtype=np.bool_)
+        mask = np.random.randint(0, 100, size=self.n_codewords)
+        mask = mask < 80
         # mask = np.ones(self.n_codewords, dtype=np.bool_)
 
         msg = Mask()

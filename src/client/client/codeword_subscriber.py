@@ -7,7 +7,7 @@ from ament_index_python.packages import get_package_share_directory
 import numpy as np
 
 from sensor_msgs.msg import Image
-from arc_interfaces.msg import Code
+from arc_interfaces.msg import Code, DecodedImage
 
 from dall_e import map_pixels, unmap_pixels, load_model
 from dall_e import Encoder, Decoder
@@ -31,6 +31,7 @@ class CodeSubscriber(rclpy.node.Node):
 			self.code_callback, 1
 		)
 		self.rec_pub = self.create_publisher(Image, '/camera/camera/color/reconstructed', 1)
+		self.my_rec_pub = self.create_publisher(DecodedImage, '/camera/camera/color/recon', 1)
 
 		self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -50,11 +51,14 @@ class CodeSubscriber(rclpy.node.Node):
 		self.enc.to(self.device)
 
 		inp_mask = map_pixels(
-			torch.zeros(1, 3, self.img_height, self.img_width, dtype=torch.float32, device=self.device)
+			32*torch.ones(1, 3, self.img_height, self.img_width, dtype=torch.float32, device=self.device)
 		)
 		with torch.no_grad():
 			mask_codes = torch.argmax(self.enc(inp_mask), dim=1)  # (1, H', W')
 		self.mask_code_flat = mask_codes.flatten().cpu().numpy().astype(np.int64)  # (N,)
+
+		self.enc.cpu()
+		del self.enc
 
 	def code_callback(self, msg: Code):
 		now_ns = self.get_clock().now().nanoseconds
@@ -94,6 +98,19 @@ class CodeSubscriber(rclpy.node.Node):
 		rec_msg.step = img_np.shape[1] * 3
 		rec_msg.data = img_np.tobytes()
 		self.rec_pub.publish(rec_msg)
+
+		my_rec_msg = DecodedImage()
+		my_rec_msg.header.stamp = self.get_clock().now().to_msg()
+		my_rec_msg.header.frame_id = msg.header.frame_id
+		my_rec_msg.length = msg.length
+		my_rec_msg.mask = msg.mask
+		my_rec_msg.height = img_np.shape[0]
+		my_rec_msg.width = img_np.shape[1]
+		my_rec_msg.encoding = 'rgb8'
+		my_rec_msg.is_bigendian = False
+		my_rec_msg.step = img_np.shape[1] * 3
+		my_rec_msg.data = img_np.tobytes()
+		self.my_rec_pub.publish(my_rec_msg)
 
 		latency_ms = (self.get_clock().now().nanoseconds - now_ns) / 1e6
 		self.get_logger().info(f'reconstructed {img_np.shape[1]}x{img_np.shape[0]}  latency: {latency_ms:.4f} ms')
