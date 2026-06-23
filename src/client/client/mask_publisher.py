@@ -22,7 +22,7 @@ class MaskPublisher(rclpy.node.Node):
     def timer_callback(self):
         mask = np.random.randint(0, 100, size=self.n_codewords)
         mask = mask < 80
-        # mask = np.ones(self.n_codewords, dtype=np.bool_)
+        mask = np.ones(self.n_codewords, dtype=np.bool_)
 
         msg = Mask()
         msg.header.stamp = self.get_clock().now().to_msg()

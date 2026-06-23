@@ -32,10 +32,10 @@ from pathlib import Path
 
 # Desktop dev box: point at the local TRT install. On Jetson the system TRT
 # is already on the loader path, so this env-default is harmless.
-os.environ.setdefault(
-    "LD_LIBRARY_PATH",
-    "/home/leonard/TensorRT-8.6.1.6/lib:" + os.environ.get("LD_LIBRARY_PATH", ""),
-)
+# os.environ.setdefault(
+#     "LD_LIBRARY_PATH",
+#     "/home/unitree/TensorRT-8.6.1.6/lib:" + os.environ.get("LD_LIBRARY_PATH", ""),
+# )
 
 import torch
 from torch.utils.data import DataLoader
@@ -157,10 +157,10 @@ def main() -> None:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--onnx",   default="/home/leonard/arc_ws/src/enc.onnx")
-    p.add_argument("--data-root", default="/home/leonard/dvae/data")
-    p.add_argument("--cache",  default="/home/leonard/arc_ws/src/enc.cache")
-    p.add_argument("--engine", default="/home/leonard/arc_ws/src/enc_int8.trt")
+    p.add_argument("--onnx",   default="/home/unitree/arc_ws/src/enc.onnx")
+    p.add_argument("--data-root", default="./dataset")
+    p.add_argument("--cache",  default="/home/unitree/arc_ws/src/enc.cache")
+    p.add_argument("--engine", default="/home/unitree/arc_ws/src/enc_int8.trt")
     p.add_argument("--image-size", default="240x320",
                     help="HxW image size — must match ONNX's input dims")
     p.add_argument("--batch-size", type=int, default=4)

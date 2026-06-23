@@ -1,7 +1,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <arc_interfaces/msg/code.hpp>
-#include <arc_interfaces/msg/mask.hpp>
+#include <arc_interfaces/msg/decoded_image.hpp>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
 #include <torch/torch.h>
@@ -18,11 +18,15 @@
 #include <string>
 #include <vector>
 
-static constexpr int BITS_PER_CODEWORD = 13;  // 2^13 == 8192 vocab size
+static constexpr int BITS_PER_CODEWORD = 13;   // 2^13 == 8192 vocab size
+static constexpr int VOCAB_SIZE = 8192;
+static constexpr float LOGIT_LAPLACE_EPS = 0.1f;
 
-static torch::Tensor map_pixels(torch::Tensor x, float eps = 0.1f)
+// Inverse of dall_e.utils.map_pixels: clamp((x - eps) / (1 - 2 eps), 0, 1).
+static torch::Tensor unmap_pixels(torch::Tensor x)
 {
-  return (1.0f - 2.0f * eps) * x + eps;
+  return torch::clamp(
+    (x - LOGIT_LAPLACE_EPS) / (1.0f - 2.0f * LOGIT_LAPLACE_EPS), 0.0f, 1.0f);
 }
 
 class TRTLogger : public nvinfer1::ILogger
@@ -35,74 +39,124 @@ class TRTLogger : public nvinfer1::ILogger
   }
 };
 
-class CodePublisher : public rclcpp::Node
+class CodeSubscriber : public rclcpp::Node
 {
 public:
-  CodePublisher()
-  : Node("code_publisher"),
-    trt_w_(320), trt_h_(240),
-    h_prime_(trt_h_ / 8), w_prime_(trt_w_ / 8),
+  CodeSubscriber()
+  : Node("code_subscriber"),
+    img_w_(320), img_h_(240),
+    h_prime_(img_h_ / 8), w_prime_(img_w_ / 8),
     n_codewords_(h_prime_ * w_prime_),
-    device_(torch::kCUDA),
-    cam_h_(0), cam_w_(0)
+    device_id_(declare_parameter<int>("device", 0)),
+    device_(torch::kCUDA, static_cast<torch::DeviceIndex>(device_id_))
   {
+    int n_devices = 0;
+    cudaGetDeviceCount(&n_devices);
+    if (device_id_ < 0 || device_id_ >= n_devices) {
+      throw std::runtime_error(
+              "requested CUDA device " + std::to_string(device_id_) +
+              " but only " + std::to_string(n_devices) + " visible");
+    }
+    // Bind this thread (constructor + ROS callback thread are the same under
+    // rclcpp::spin) to the chosen device. The CUDAStreamGuard in the
+    // callback re-pins inside the scope, but cudaStreamCreate / TRT
+    // deserialize must see the right current device too.
+    if (cudaSetDevice(device_id_) != cudaSuccess) {
+      throw std::runtime_error("cudaSetDevice failed for device " +
+              std::to_string(device_id_));
+    }
+    RCLCPP_INFO(get_logger(), "using CUDA device %d", device_id_);
+
     if (cudaStreamCreate(&stream_) != cudaSuccess) {
       throw std::runtime_error("cudaStreamCreate failed");
     }
 
-    std::string share_dir = ament_index_cpp::get_package_share_directory("client_cpp");
-    load_engine(share_dir + "/checkpoints/enc_int8.trt");
+    std::string share_dir = ament_index_cpp::get_package_share_directory("server_cpp");
+    std::string engine_name = declare_parameter<std::string>("engine", "dec_fp16.trt");
+    load_engine(share_dir + "/checkpoints/" + engine_name);
+    load_mask_token(share_dir + "/checkpoints/mask_token.bin");
 
     // Pre-allocated CUDA buffers whose pointers are handed directly to TRT.
-    // Sized for the TRT engine's fixed input: 1x3x240x320.
-    input_buf_ = torch::empty(
-      {1, 3, trt_h_, trt_w_},
+    // Sized for the TRT engine's fixed input: 1 x V x H' x W'.
+    input_buf_ = torch::zeros(
+      {1, VOCAB_SIZE, h_prime_, w_prime_},
       torch::TensorOptions().dtype(torch::kFloat32).device(device_));
-    output_buf_ = torch::empty(
-      {1, 8192, h_prime_, w_prime_},
-      torch::TensorOptions().dtype(torch::kFloat32).device(device_));
-
-    int input_idx = -1, output_idx = -1;
-    for (int i = 0; i < engine_->getNbBindings(); ++i) {
-      if (engine_->bindingIsInput(i)) input_idx  = i;
-      else                            output_idx = i;
-    }
-    if (input_idx < 0 || output_idx < 0) {
-      throw std::runtime_error("TRT engine must have exactly one input and one output binding");
-    }
-    auto in_dims  = engine_->getBindingDimensions(input_idx);
-    auto out_dims = engine_->getBindingDimensions(output_idx);
-    if (in_dims.d[2] != trt_h_ || in_dims.d[3] != trt_w_) {
+    // Output dtype must match what the engine writes. build_decoder.py
+    // currently emits FP16 outputs (DataType::kHALF); allocating FP32 here
+    // silently reinterprets pairs of FP16s as single FP32s and produces a
+    // tiled / garbled reconstruction.
+    auto out_dtype = engine_->getTensorDataType(output_name_.c_str());
+    torch::Dtype out_torch_dtype;
+    if (out_dtype == nvinfer1::DataType::kHALF) {
+      out_torch_dtype = torch::kHalf;
+    } else if (out_dtype == nvinfer1::DataType::kFLOAT) {
+      out_torch_dtype = torch::kFloat32;
+    } else {
       throw std::runtime_error(
-        "enc_int8.trt was built for" +
-        std::to_string(in_dims.d[3]) + "x" + std::to_string(in_dims.d[2]) +
-        " but node expects " +
-        std::to_string(trt_w_) + "x" + std::to_string(trt_h_));
+              "decoder engine output dtype must be FP16 or FP32");
     }
-    // Sanity-check that h_prime/w_prime match the engine's output spatial dims.
-    if (out_dims.d[2] != h_prime_ || out_dims.d[3] != w_prime_) {
-      throw std::runtime_error("enc_int8.trt output spatial dims don't match h_prime/w_prime");
+    output_buf_ = torch::empty(
+      {1, 6, img_h_, img_w_},
+      torch::TensorOptions().dtype(out_torch_dtype).device(device_));
+
+    if (input_name_.empty() || output_name_.empty()) {
+      throw std::runtime_error(
+              "TRT engine must have exactly one input and one output tensor");
+    }
+    auto in_dims  = engine_->getTensorShape(input_name_.c_str());
+    auto out_dims = engine_->getTensorShape(output_name_.c_str());
+    if (in_dims.d[1] != VOCAB_SIZE ||
+      in_dims.d[2] != h_prime_ || in_dims.d[3] != w_prime_)
+    {
+      throw std::runtime_error(
+              "decoder engine input dims [V,H',W'] don't match expected " +
+              std::to_string(VOCAB_SIZE) + "x" +
+              std::to_string(h_prime_) + "x" + std::to_string(w_prime_));
+    }
+    if (out_dims.d[2] != img_h_ || out_dims.d[3] != img_w_) {
+      throw std::runtime_error("decoder engine output spatial dims don't match "
+              + std::to_string(img_h_) + "x" + std::to_string(img_w_));
     }
 
-    bindings_[input_idx] = input_buf_.data_ptr<float>();
-    bindings_[output_idx] = output_buf_.data_ptr<float>();
+    // TRT 10 tensor-address API: set once on the context, then enqueueV3.
+    if (!context_->setTensorAddress(input_name_.c_str(),
+            input_buf_.data_ptr<float>()))
+    {
+      throw std::runtime_error("setTensorAddress failed for input");
+    }
+    if (!context_->setTensorAddress(output_name_.c_str(),
+            output_buf_.data_ptr()))
+    {
+      throw std::runtime_error("setTensorAddress failed for output");
+    }
 
-    img_sub_ = create_subscription<sensor_msgs::msg::Image>(
-      "/camera/camera/color/image_raw", 1,
-      std::bind(&CodePublisher::img_callback, this, std::placeholders::_1));
-    mask_sub_ = create_subscription<arc_interfaces::msg::Mask>(
-      "/camera/camera/color/mask", 1,
-      std::bind(&CodePublisher::mask_callback, this, std::placeholders::_1));
-    code_pub_ = create_publisher<arc_interfaces::msg::Code>(
-      "/camera/camera/color/code", 1);
-
-    // Default mask: transmit all codewords until a Mask message arrives.
-    mask_ = torch::ones(
+    // Pinned staging buffers for the per-message decomposition of mask →
+    // (transmitted codeword, transmitted position) pairs. Both sized to the
+    // worst case n_codewords_ (= every position transmitted).
+    pinned_tx_codes_ = torch::empty(
       {n_codewords_},
-      torch::TensorOptions().dtype(torch::kBool).device(device_));
+      torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true));
+    pinned_tx_pos_ = torch::empty(
+      {n_codewords_},
+      torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true));
+
+    // Pre-allocated GPU ones buffer used as the source for index_put_ when
+    // setting the one-hot 1.0 at (codeword, position). Slice down to the
+    // actual n_selected per message.
+    ones_full_ = torch::ones(
+      {n_codewords_},
+      torch::TensorOptions().dtype(torch::kFloat32).device(device_));
+
+    code_sub_ = create_subscription<arc_interfaces::msg::Code>(
+      "/camera/camera/color/code", 1,
+      std::bind(&CodeSubscriber::code_callback, this, std::placeholders::_1));
+    rec_pub_ = create_publisher<sensor_msgs::msg::Image>(
+      "/camera/camera/color/reconstructed", 1);
+    my_rec_pub_ = create_publisher<arc_interfaces::msg::DecodedImage>(
+      "/camera/camera/color/recon", 1);
   }
 
-  ~CodePublisher()
+  ~CodeSubscriber()
   {
     if (context_) {delete context_;}
     if (engine_) {delete engine_;}
@@ -131,179 +185,230 @@ private:
     if (!context_) {
       throw std::runtime_error("Failed to create TRT execution context");
     }
-    int nb = engine_->getNbBindings();
-    bindings_.resize(static_cast<size_t>(nb));
 
+    int nb = engine_->getNbIOTensors();
     for (int i = 0; i < nb; ++i) {
-      auto dtype = engine_->getBindingDataType(i);
-      auto dims  = engine_->getBindingDimensions(i);
+      const char * name = engine_->getIOTensorName(i);
+      auto mode  = engine_->getTensorIOMode(name);
+      auto dtype = engine_->getTensorDataType(name);
+      auto dims  = engine_->getTensorShape(name);
+      const bool is_input = (mode == nvinfer1::TensorIOMode::kINPUT);
+      if (is_input) {input_name_ = name;}
+      else          {output_name_ = name;}
       const char * dt_str =
         (dtype == nvinfer1::DataType::kFLOAT) ? "FP32" :
         (dtype == nvinfer1::DataType::kHALF)  ? "FP16" :
-        (dtype == nvinfer1::DataType::kINT8)   ? "INT8" : "other";
-      std::fprintf(stderr, "[TRT] binding[%d] %-22s  %s  %s  dims=[%d,%d,%d,%d]\n",
-        i, engine_->getBindingName(i),
-        engine_->bindingIsInput(i) ? "INPUT " : "OUTPUT",
+        (dtype == nvinfer1::DataType::kINT8)  ? "INT8" : "other";
+      std::fprintf(stderr, "[TRT] tensor[%d] %-22s  %s  %s  dims=[%d,%d,%d,%d]\n",
+        i, name,
+        is_input ? "INPUT " : "OUTPUT",
         dt_str,
-        dims.nbDims > 0 ? dims.d[0] : -1,
-        dims.nbDims > 1 ? dims.d[1] : -1,
-        dims.nbDims > 2 ? dims.d[2] : -1,
-        dims.nbDims > 3 ? dims.d[3] : -1);
+        dims.nbDims > 0 ? static_cast<int>(dims.d[0]) : -1,
+        dims.nbDims > 1 ? static_cast<int>(dims.d[1]) : -1,
+        dims.nbDims > 2 ? static_cast<int>(dims.d[2]) : -1,
+        dims.nbDims > 3 ? static_cast<int>(dims.d[3]) : -1);
     }
   }
 
-  // Copies the ROS image into pinned memory, transfers to GPU, resizes to
-  // the TRT engine's fixed input (trt_h_ x trt_w_) if needed, then
-  // preprocesses (HWC uint8 -> CHW float32 in [eps,1-eps]) into input_buf_.
-  void load_image(const sensor_msgs::msg::Image::SharedPtr & msg)
+  // Loads softmax(mask_token) as a flat [V] float32 binary written by
+  // build_decoder.py. This is the learned distribution the fine-tuned
+  // decoder expects at non-transmitted spatial positions — replaces the
+  // old encoder-on-uniform-gray per-position one-hot mask_codes.bin.
+  void load_mask_token(const std::string & path)
   {
-    const int new_h = static_cast<int>(msg->height);
-    const int new_w = static_cast<int>(msg->width);
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+      throw std::runtime_error("Cannot open mask token: " + path);
+    }
+    std::streamsize sz = f.tellg();
+    const std::streamsize expected =
+      static_cast<std::streamsize>(VOCAB_SIZE * sizeof(float));
+    if (sz != expected) {
+      throw std::runtime_error(
+              "mask_token.bin size mismatch: got " + std::to_string(sz) +
+              " bytes, expected " + std::to_string(expected));
+    }
+    f.seekg(0);
+    std::vector<float> host(VOCAB_SIZE);
+    f.read(reinterpret_cast<char *>(host.data()), sz);
 
-    // Re-allocate pinned host buffer only when the camera resolution changes.
-    if (new_h != cam_h_ || new_w != cam_w_) {
-      cam_h_ = new_h;
-      cam_w_ = new_w;
-      pinned_input_ = torch::empty(
-        {cam_h_, cam_w_, 3},
-        torch::TensorOptions().dtype(torch::kUInt8).pinned_memory(true));
-      RCLCPP_INFO(get_logger(),
-        "camera %dx%d -> TRT input %dx%d", cam_w_, cam_h_, trt_w_, trt_h_);
+    // Sanity check: distribution should sum to ~1.
+    double sum = 0.0;
+    for (float v : host) {sum += v;}
+    if (std::abs(sum - 1.0) > 1e-2) {
+      RCLCPP_WARN(get_logger(),
+        "mask_token distribution sum=%.6f (expected ~1.0)", sum);
     }
 
-    const int n_ch = static_cast<int>(msg->data.size()) / (cam_h_ * cam_w_);
-    uint8_t * dst = pinned_input_.data_ptr<uint8_t>();
-    const uint8_t * src = msg->data.data();
+    mask_token_dist_ = torch::from_blob(
+      host.data(), {VOCAB_SIZE},
+      torch::TensorOptions().dtype(torch::kFloat32)
+    ).clone().to(device_);
 
-    if (n_ch == 3) {
-      std::memcpy(dst, src, static_cast<size_t>(cam_h_ * cam_w_ * 3));
-    } else {
-      // Strip extra channels (e.g. RGBA -> RGB) on CPU before transfer.
-      for (int i = 0; i < cam_h_ * cam_w_; ++i, dst += 3, src += n_ch) {
-        dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
-      }
-    }
-
-    // All LibTorch CUDA ops below go on stream_, ordered with TRT enqueue.
-    at::cuda::CUDAStreamGuard guard(
-      at::cuda::getStreamFromExternal(stream_, device_.index()));
-
-    // Async H2D.
-    auto gpu_uint8 = pinned_input_.to(device_, /*non_blocking=*/true);
-
-    // GPU: (H,W,3) uint8 -> (1,3,H,W) float32 in [eps, 1-eps].
-    auto gpu_float = map_pixels(
-      gpu_uint8.unsqueeze(0).permute({0, 3, 1, 2})
-      .to(torch::kFloat32).mul_(1.0f / 255.0f));
-
-    // Bilinear resize to TRT engine input dims when camera resolution differs.
-    if (cam_h_ != trt_h_ || cam_w_ != trt_w_) {
-      gpu_float = torch::nn::functional::interpolate(
-        gpu_float,
-        torch::nn::functional::InterpolateFuncOptions()
-          .size(std::vector<int64_t>{trt_h_, trt_w_})
-          .mode(torch::kBilinear)
-          .align_corners(false));
-    }
-
-    input_buf_.copy_(gpu_float);
+    RCLCPP_INFO(get_logger(),
+      "loaded mask_token distribution from %s (V=%d, sum=%.4f)",
+      path.c_str(), VOCAB_SIZE, sum);
   }
 
-  // Submits input_buf_ to TRT on stream_, synchronizes, returns output_buf_.
-  torch::Tensor trt_forward()
+  // Unpacks M * 13 bits MSB-first from packed bytes into M int64 codewords.
+  // Mirrors the pack done in client_cpp/codeword_publisher.cpp; int64 is the
+  // dtype required by LibTorch advanced indexing / one-hot.
+  void unpack_codewords(const std::vector<uint8_t> & data, int n_selected,
+                        int64_t * out)
   {
-    if (!context_->enqueueV2(bindings_.data(), stream_, nullptr)) {
-      throw std::runtime_error("TRT enqueueV2 failed");
-    }
-    cudaStreamSynchronize(stream_);
-    return output_buf_;
-  }
-
-  // Packs N codewords of 13 bits each (MSB-first) into a byte vector.
-  std::vector<uint8_t> pack_codewords(const torch::Tensor & z_flat)
-  {
-    auto z_cpu = z_flat.to(torch::kCPU).to(torch::kInt32).contiguous();
-    int64_t n = z_cpu.size(0);
-    int64_t total_bytes = (n * BITS_PER_CODEWORD + 7) / 8;
-    std::vector<uint8_t> packed(static_cast<size_t>(total_bytes), 0u);
-
-    const int32_t * data = z_cpu.data_ptr<int32_t>();
     int64_t bit_pos = 0;
-    for (int64_t i = 0; i < n; ++i) {
-      uint16_t cw = static_cast<uint16_t>(data[i]);
+    for (int i = 0; i < n_selected; ++i) {
+      uint16_t cw = 0;
       for (int b = BITS_PER_CODEWORD - 1; b >= 0; --b) {
-        uint8_t bit = (cw >> b) & 1u;
-        packed[bit_pos / 8] |= static_cast<uint8_t>(bit << (7 - (bit_pos % 8)));
+        uint8_t bit = (data[bit_pos / 8] >> (7 - (bit_pos % 8))) & 1u;
+        cw |= static_cast<uint16_t>(bit) << b;
         ++bit_pos;
       }
+      out[i] = static_cast<int64_t>(cw);
     }
-    return packed;
   }
 
-  void mask_callback(const arc_interfaces::msg::Mask::SharedPtr msg)
-  {
-    std::vector<uint8_t> tmp(msg->mask.begin(), msg->mask.end());
-    mask_ = torch::tensor(
-      tmp, torch::TensorOptions().dtype(torch::kUInt8)).to(torch::kBool).to(device_);
-  }
-
-  void img_callback(const sensor_msgs::msg::Image::SharedPtr msg)
+  void code_callback(const arc_interfaces::msg::Code::SharedPtr msg)
   {
     rclcpp::Time t0 = get_clock()->now();
 
-    load_image(msg);
-    auto z = torch::argmax(trt_forward(), 1);          // (1, H', W')
-    auto z_flat = z.squeeze(0).flatten();              // (H'*W',)
-    auto mask_indices = mask_.nonzero().squeeze(1);    // selected indices
-    auto z_selected = z_flat.index_select(0, mask_indices);
+    const int n_selected = static_cast<int>(msg->length);
+    if (static_cast<int>(msg->mask.size()) != n_codewords_) {
+      RCLCPP_ERROR(get_logger(),
+        "mask length %zu != expected %d, dropping message",
+        msg->mask.size(), n_codewords_);
+      return;
+    }
 
-    auto packed = pack_codewords(z_selected);
-    uint16_t n_selected = static_cast<uint16_t>(mask_indices.size(0));
+    // 1) On the CPU side, decompose the bitmask into the list of transmitted
+    //    spatial positions, and unpack the M codeword indices that the
+    //    publisher sent for those positions. Stage both into pinned int64
+    //    host buffers so the H2D copies can overlap with TRT enqueue.
+    int64_t * pos_dst  = pinned_tx_pos_.data_ptr<int64_t>();
+    int64_t * code_dst = pinned_tx_codes_.data_ptr<int64_t>();
 
-    auto mask_cpu = mask_.to(torch::kCPU).contiguous();
-    const bool * mask_ptr = mask_cpu.data_ptr<bool>();
-    std::vector<bool> mask_out(mask_ptr, mask_ptr + mask_cpu.numel());
+    int sel_idx = 0;
+    for (int i = 0; i < n_codewords_; ++i) {
+      if (msg->mask[i]) {
+        if (sel_idx >= n_selected) {
+          RCLCPP_ERROR(get_logger(),
+            "mask has more set bits than msg.length=%d", n_selected);
+          return;
+        }
+        pos_dst[sel_idx++] = static_cast<int64_t>(i);
+      }
+    }
+    if (sel_idx != n_selected) {
+      RCLCPP_WARN(get_logger(),
+        "mask set bits (%d) != msg.length (%d)", sel_idx, n_selected);
+      return;
+    }
+    unpack_codewords(msg->data, n_selected, code_dst);
 
-    arc_interfaces::msg::Code code_msg;
-    code_msg.header.stamp = msg->header.stamp;
-    code_msg.header.frame_id = msg->header.frame_id;
-    code_msg.length = n_selected;
-    code_msg.data = packed;
-    code_msg.mask = mask_out;
-    code_pub_->publish(code_msg);
+    // 2) All LibTorch CUDA ops below go on stream_, ordered with TRT enqueue.
+    at::cuda::CUDAStreamGuard guard(
+      at::cuda::getStreamFromExternal(stream_, device_.index()));
+
+    auto tx_codes_gpu = pinned_tx_codes_.slice(0, 0, n_selected)
+                          .to(device_, /*non_blocking=*/true);
+    auto tx_pos_gpu   = pinned_tx_pos_.slice(0, 0, n_selected)
+                          .to(device_, /*non_blocking=*/true);
+
+    // 3) Build the (V, N) decoder input.
+    //    Non-transmitted columns hold the learned MASK_TOKEN distribution;
+    //    transmitted columns hold a hard one-hot at the received codeword.
+    auto flat = input_buf_.view({VOCAB_SIZE, n_codewords_});
+
+    // (a) Broadcast mask_token distribution into every column. This sets
+    //     non-transmitted columns to their final value and gives transmitted
+    //     columns a placeholder that we'll overwrite next.
+    flat.copy_(mask_token_dist_.view({VOCAB_SIZE, 1})
+                 .expand({VOCAB_SIZE, n_codewords_}));
+
+    // (b) Zero transmitted columns, then place 1.0 at (codeword, position).
+    flat.index_fill_(/*dim=*/1, tx_pos_gpu, 0.0);
+    flat.index_put_({tx_codes_gpu, tx_pos_gpu},
+                    ones_full_.slice(0, 0, n_selected));
+
+    // 4) TRT inference (TRT 10: tensor addresses already set in the ctor).
+    if (!context_->enqueueV3(stream_)) {
+      throw std::runtime_error("TRT enqueueV3 failed");
+    }
+
+    // 5) Post-process (still on stream_): sigmoid + unmap_pixels + to uint8.
+    //    Cast to float32 because output_buf_ may be FP16 (matches engine).
+    using torch::indexing::Slice;
+    auto x_stats = output_buf_.index({Slice(), Slice(0, 3)})
+                     .to(torch::kFloat32);                     // (1, 3, H, W)
+    auto x_rec = unmap_pixels(torch::sigmoid(x_stats));        // (1, 3, H, W)
+    auto img_uint8 = (x_rec * 255.0f).clamp(0.0f, 255.0f)
+                       .to(torch::kUInt8)
+                       .squeeze(0)
+                       .permute({1, 2, 0})       // (H, W, 3)
+                       .contiguous()
+                       .to(torch::kCPU);
+
+    cudaStreamSynchronize(stream_);
+
+    // 6) Build and publish messages.
+    const int h = img_h_, w = img_w_;
+    const uint8_t * img_ptr = img_uint8.data_ptr<uint8_t>();
+    std::vector<uint8_t> img_bytes(img_ptr, img_ptr + h * w * 3);
+
+    sensor_msgs::msg::Image rec_msg;
+    rec_msg.header.stamp = get_clock()->now();
+    rec_msg.header.frame_id = msg->header.frame_id;
+    rec_msg.height = static_cast<uint32_t>(h);
+    rec_msg.width = static_cast<uint32_t>(w);
+    rec_msg.encoding = "rgb8";
+    rec_msg.is_bigendian = 0;
+    rec_msg.step = static_cast<uint32_t>(w * 3);
+    rec_msg.data = img_bytes;
+    rec_pub_->publish(rec_msg);
+
+    arc_interfaces::msg::DecodedImage my_msg;
+    my_msg.header = rec_msg.header;
+    my_msg.length = msg->length;
+    my_msg.mask = msg->mask;
+    my_msg.height = rec_msg.height;
+    my_msg.width = rec_msg.width;
+    my_msg.encoding = rec_msg.encoding;
+    my_msg.is_bigendian = rec_msg.is_bigendian;
+    my_msg.step = rec_msg.step;
+    my_msg.data = std::move(img_bytes);
+    my_rec_pub_->publish(my_msg);
 
     double latency_ms = (get_clock()->now() - t0).nanoseconds() / 1e6;
     RCLCPP_INFO(get_logger(),
-      "codewords: %d  selected: %d  packed: %zu bytes  latency: %.4f ms",
-      n_codewords_, n_selected, packed.size(), latency_ms);
+      "reconstructed %dx%d  latency: %.4f ms", w, h, latency_ms);
   }
 
-  const int trt_w_, trt_h_;
+  const int img_w_, img_h_;
   const int h_prime_, w_prime_, n_codewords_;
+  const int device_id_;
   torch::Device device_;
-  int cam_h_, cam_w_;
 
   TRTLogger logger_;
   nvinfer1::IRuntime * runtime_{nullptr};
   nvinfer1::ICudaEngine * engine_{nullptr};
   nvinfer1::IExecutionContext * context_{nullptr};
   cudaStream_t stream_{nullptr};
-  std::vector<void *> bindings_;
+  std::string input_name_, output_name_;
 
-  torch::Tensor pinned_input_;
   torch::Tensor input_buf_, output_buf_;
+  torch::Tensor pinned_tx_codes_, pinned_tx_pos_;
+  torch::Tensor ones_full_;
+  torch::Tensor mask_token_dist_;
 
-  torch::Tensor mask_;
-
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr img_sub_;
-  rclcpp::Subscription<arc_interfaces::msg::Mask>::SharedPtr mask_sub_;
-  rclcpp::Publisher<arc_interfaces::msg::Code>::SharedPtr code_pub_;
+  rclcpp::Subscription<arc_interfaces::msg::Code>::SharedPtr code_sub_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr rec_pub_;
+  rclcpp::Publisher<arc_interfaces::msg::DecodedImage>::SharedPtr my_rec_pub_;
 };
 
 int main(int argc, char * argv[])
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<CodePublisher>());
+  rclcpp::spin(std::make_shared<CodeSubscriber>());
   rclcpp::shutdown();
   return 0;
 }

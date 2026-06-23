@@ -49,7 +49,7 @@ def download_openimages_v7(
         split=split,
         max_samples=max_samples,
         label_types=[],
-        dataset_dir=str(Path(root) / "_fo"),
+        # dataset_dir=str(Path(root) / "_fo"),
     )
     src = Path(ds.first().filepath).parent
     target.mkdir(parents=True, exist_ok=True)

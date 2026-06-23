@@ -30,6 +30,7 @@ setup(
             'pub = client.codeword_publisher:main',
             'sub = client.codeword_subscriber:main',
             'mask = client.mask_publisher:main',
+            "camera_publisher = client.go2_camera_publisher:main",
         ],
     },
 )

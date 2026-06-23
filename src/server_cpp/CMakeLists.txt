@@ -1,0 +1,96 @@
+cmake_minimum_required(VERSION 3.8)
+project(server_cpp)
+
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(arc_interfaces REQUIRED)
+find_package(ament_index_cpp REQUIRED)
+find_package(CUDAToolkit REQUIRED)
+
+# Locate LibTorch (used for one-hot scatter, sigmoid/unmap, host transfer).
+execute_process(
+  COMMAND python3 -c "import torch; print(torch.utils.cmake_prefix_path)"
+  OUTPUT_VARIABLE TORCH_CMAKE_PREFIX_PATH
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+list(APPEND CMAKE_PREFIX_PATH "${TORCH_CMAKE_PREFIX_PATH}")
+find_package(Torch REQUIRED)
+
+# TensorRT lives in system-wide paths on both JetPack (aarch64) and desktop
+# .deb installs (x86_64); also try CUDA-bundled and a user override.
+set(TENSORRT_LIB_SEARCH_PATHS
+  /usr/lib/aarch64-linux-gnu        # JetPack
+  /usr/lib/x86_64-linux-gnu         # Ubuntu .deb on x86_64
+  /usr/local/cuda/lib64             # CUDA-bundled
+  /usr/local/tensorrt/lib           # tarball install
+  $ENV{TENSORRT_ROOT}/lib           # user override
+)
+set(TENSORRT_INCLUDE_SEARCH_PATHS
+  /usr/include/aarch64-linux-gnu
+  /usr/include/x86_64-linux-gnu
+  /usr/local/cuda/include
+  /usr/local/tensorrt/include
+  $ENV{TENSORRT_ROOT}/include
+)
+find_library(NVINFER_LIB nvinfer REQUIRED
+  PATHS ${TENSORRT_LIB_SEARCH_PATHS})
+find_path(NVINFER_INCLUDE_DIR NvInfer.h REQUIRED
+  PATHS ${TENSORRT_INCLUDE_SEARCH_PATHS})
+
+add_executable(codeword_subscriber src/codeword_subscriber.cpp)
+target_include_directories(codeword_subscriber PRIVATE
+  include
+  ${NVINFER_INCLUDE_DIR}
+)
+target_link_libraries(codeword_subscriber
+  "${TORCH_LIBRARIES}"
+  ${NVINFER_LIB}
+  CUDA::cudart
+)
+ament_target_dependencies(codeword_subscriber
+  rclcpp
+  sensor_msgs
+  arc_interfaces
+  ament_index_cpp
+)
+set_property(TARGET codeword_subscriber PROPERTY CXX_STANDARD 17)
+set_target_properties(codeword_subscriber PROPERTIES
+  INSTALL_RPATH "${TORCH_INSTALL_PREFIX}/lib"
+  BUILD_WITH_INSTALL_RPATH TRUE
+)
+
+install(TARGETS codeword_subscriber
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# Install the learned MASK_TOKEN distribution plus whichever decoder
+# engines (FP16 / INT8) have been built. mask_token.bin is the [V]
+# softmax(mask_token) emitted by build_decoder.py — replaces the older
+# per-position mask_codes.bin. Engines are OPTIONAL so the package still
+# configures if only one of them has been built yet.
+install(FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/../mask_token.bin
+  DESTINATION share/${PROJECT_NAME}/checkpoints
+)
+install(FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/../dec_fp16.trt
+  ${CMAKE_CURRENT_SOURCE_DIR}/../dec_int8.trt
+  ${CMAKE_CURRENT_SOURCE_DIR}/../dec_fp16_63.trt
+  ${CMAKE_CURRENT_SOURCE_DIR}/../dec_int8_63.trt
+  DESTINATION share/${PROJECT_NAME}/checkpoints
+  OPTIONAL
+)
+
+if(BUILD_TESTING)
+  find_package(ament_lint_auto REQUIRED)
+  set(ament_cmake_copyright_FOUND TRUE)
+  set(ament_cmake_cpplint_FOUND TRUE)
+  ament_lint_auto_find_test_dependencies()
+endif()
+
+ament_package()

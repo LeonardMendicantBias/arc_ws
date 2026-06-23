@@ -39,9 +39,10 @@ class Inpainter(Node):
 		share_dir = get_package_share_directory('server')
 		self.inpainting_tool = InpaintingTool(
 			ckpt=os.path.join(share_dir, 'checkpoints', 'dstt.pth'),
-			refine_window=4, refine_length=16,
+			refine_window=4, n_refs=16,
 			online_window=7, n_neighbors=8,
-			ref_step=20, compile_online=False
+			ref_step=20, compile_models=False,
+			refine_device="cuda:0"
 		)
 		self.inpainting_tool.setup()
 		self.inpainting_tool.reset()

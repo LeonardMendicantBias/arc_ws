@@ -43,9 +43,7 @@ set(TENSORRT_INCLUDE_SEARCH_PATHS
 )
 find_library(NVINFER_LIB nvinfer REQUIRED
   PATHS ${TENSORRT_LIB_SEARCH_PATHS})
-  PATHS ${TENSORRT_LIB_SEARCH_PATHS})
 find_path(NVINFER_INCLUDE_DIR NvInfer.h REQUIRED
-  PATHS ${TENSORRT_INCLUDE_SEARCH_PATHS})
   PATHS ${TENSORRT_INCLUDE_SEARCH_PATHS})
 
 add_executable(codeword_publisher src/codeword_publisher.cpp)
@@ -74,7 +72,7 @@ install(TARGETS codeword_publisher
   DESTINATION lib/${PROJECT_NAME}
 )
 
-install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../client/client/enc_int8.trt
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/enc_int8.trt ${CMAKE_CURRENT_SOURCE_DIR}/enc_fp16.trt
   DESTINATION share/${PROJECT_NAME}/checkpoints
 )
 

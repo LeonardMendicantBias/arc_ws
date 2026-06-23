@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS xmlns="https://cdds.io/config">
+
+  <!-- ROS_DOMAIN_ID=0 : robot mainboard ROS, NIC enP8p1s0, multicast discovery -->
+  <Domain Id="0">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="enP8p1s0" priority="default" multicast="default"/>
+      </Interfaces>
+      <AllowMulticast>true</AllowMulticast>
+    </General>
+    <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>50</MaxAutoParticipantIndex>
+    </Discovery>
+  </Domain>
+
+  <!-- ROS_DOMAIN_ID=1 : Jetson, NIC enxc84d44272aa2, no multicast, static peers -->
+  <Domain Id="1">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="enxc84d44272aa2" priority="default" multicast="false"/>
+	<NetowrkInterface name="wlx0cef154900d1" priority="default" multicast="false"/>
+      </Interfaces>  <!-- wlx0cef154900d1 --> <!-- enxc84d44272aa2 -->
+      <AllowMulticast>false</AllowMulticast>
+    </General>
+    <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>50</MaxAutoParticipantIndex>
+      <Peers>
+        <Peer address="192.168.0.5"/>
+        <Peer address="192.168.0.10"/>
+	<Peer address="192.168.0.38"/>
+        <Peer address="192.168.0.20"/>
+        <Peer address="192.168.0.206"/>
+      </Peers>
+    </Discovery>
+  </Domain>
+
+</CycloneDDS>
